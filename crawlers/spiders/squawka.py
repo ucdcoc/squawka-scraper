@@ -6,7 +6,7 @@ from scrapy import Request
 from scrapy.spiders import CrawlSpider
 from scrapy.spiders import Rule
 from scrapy.linkextractors import LinkExtractor
-from scrapy.shell import inspect_response
+# from scrapy.shell import inspect_response  # debugging
 
 
 class SquawkaSpider(CrawlSpider):
