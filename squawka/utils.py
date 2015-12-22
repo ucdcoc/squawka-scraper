@@ -1,41 +1,82 @@
+import gc
+import glob
+import logging
+import multiprocessing
+import numpy as np
+import os
 import pandas as pd
 import re
+import warnings
+from dateutil import parser
+from functools import partial
 from lxml import etree
 
 
+COMPETITIONS = {
+    4: 'World Cup',
+    5: 'Champions League',
+    6: 'Europa League',
+    8: 'English Barclays Premier League',
+    9: 'Dutch Eredivisie',
+    10: 'Football League Championship',
+    21: 'Italian Serie A',
+    22: 'German Bundesliga',
+    23: 'Spanish La Liga',
+    24: 'French Ligue 1',
+    98: 'US Major League Soccer',
+    114: 'Turkish Super Lig',
+    129: 'Russian Premier League',
+    199: 'Mexican Liga MX - Apertura',
+    214: 'Australian A-League',
+    363: 'Brazilian Serie A',
+    385: 'Mexican Liga MX - Clausura',
+}
+
+
+TIME_SLICE_EVENTS = [
+    'action_areas',
+    'all_passes',
+    'balls_out',
+    'blocked_events',
+    'cards',
+    'clearances',
+    'corners',
+    'crosses',
+    'extra_heat_maps',
+    'fouls',
+    'goal_keeping',
+    'goals_attempts',
+    'headed_duals',
+    'interceptions',
+    'keepersweeper',
+    'offside',
+    'oneonones',
+    'setpieces',
+    'tackles',
+    'takeons',
+]
+ALL_STATISTICS = sorted(TIME_SLICE_EVENTS + ['players', 'teams'])
+
+logger = logging.getLogger()
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s %(name)-12s %(levelname)-8s %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.DEBUG)
+
+
 class SquawkaReport:
+    """Squawka match report object.
+
+    :param path: Path to XML-file to generate match report from.
+    """
 
     def __init__(self, path):
-        self.__time_slice_events = [
-            'action_areas',
-            'all_passes',
-            'balls_out',
-            'blocked_events',
-            'cards',
-            'clearances',
-            'competition',
-            'corners',
-            'crosses',
-            'extra_heat_maps',
-            'fouls',
-            'goal_keeping',
-            'goals_attempts',
-            'headed_duals',
-            'interceptions',
-            'keepersweeper',
-            'kickoff',
-            'match_id',
-            'offside',
-            'oneonones',
-            'setpieces',
-            'tackles',
-            'takeons',
-        ]
+        self.__time_slice_events = TIME_SLICE_EVENTS
         self.path = path
         self.xml = self.read_xml(path)
 
-    # See: https://stackoverflow.com/questions/10967551/
-    # how-do-i-dynamically-create-properties-in-python
+    # See: https://stackoverflow.com/questions/10967551/how-do-i-dynamically-create-properties-in-python
     def __getattr__(self, name):
         if name in self.__time_slice_events:
             return self._parse_timeslice(name)
@@ -45,6 +86,10 @@ class SquawkaReport:
 
     @staticmethod
     def read_xml(path):
+        """Read XML file.
+        :param path: Path to XML-file.
+        :return: XML tree.
+        """
         with open(path, 'r') as f:
             data = f.read()
         xml = etree.fromstring(data)
@@ -69,7 +114,7 @@ class SquawkaReport:
 
     @property
     def competition(self):
-        return re.findall("/(.*)_\d*.xml", self.p)[0]
+        return re.findall("/(.*)_\d*.xml", self.path)[0]
 
     @property
     def filters(self):
@@ -83,7 +128,7 @@ class SquawkaReport:
     @property
     def kickoff(self):
         date = self.xml.xpath("/squawka/data_panel/game/kickoff/text()")[0]
-        return pd.to_datetime(date)
+        return parser.parse(date).strftime('%Y-%m-%d %H:%M:%S %z')
 
     @property
     def match_id(self):
@@ -95,6 +140,7 @@ class SquawkaReport:
 
     @property
     def players(self):
+        # TODO: Remove non-player elements
         xpath = '/squawka/data_panel/players/player'
         return self._get_elements(xpath)
 
@@ -106,3 +152,159 @@ class SquawkaReport:
     @property
     def venue(self):
         return self.xml.xpath("/squawka/data_panel/game/venue/text()")[0]
+
+    @property
+    def match_info(self):
+        info = ({
+            'competition': self.competition,
+            'kickoff': self.kickoff,
+            'match_id': self.match_id,
+            'name': self.name,
+            'venue': self.venue,
+        })
+        for team in self.teams:
+            for k in ['id', 'short_name']:
+                info['_'.join((team['state'], k))] = team[k]
+        return info
+
+
+def stats_from_file(path, statistic, convert=True):
+    """Load data for a statistic from file.
+
+    :param path: Path to file.
+    :param statistic: Statistic to load (e.g. 'goals_attempts', 'cards').
+    :param convert: Process and clean the data (boolean)
+    :return pd.DataFrame with data
+    """
+    report = SquawkaReport(path)
+    return stats_from_report(report, statistic, convert)
+
+
+def stats_from_report(report, statistic, convert=True):
+    """Load data for a statistic from a SquawkaReport object.
+
+    :param report: SquawkaReport object
+    :param statistic: Statistic to load (e.g. 'goals_attempts', 'cards').
+    :param convert: Process and clean the data (boolean)
+    :return pd.DataFrame with data
+    """
+    stats = pd.DataFrame(getattr(report, statistic))
+    stats['competition'] = report.competition
+    stats['kickoff'] = report.kickoff
+    stats['match_id'] = report.match_id
+    if convert:
+        return convert_export(stats)
+    else:
+        return stats
+
+
+def export_all_stats(xml_dir, out_dir, statistics=ALL_STATISTICS, convert=True, n_jobs=None,
+                     sequential=('all_passes', 'extra_heat_maps')):
+    """Export all statistics from all XML-files in a folder to CSV.
+
+    :param xml_dir: Path to folder containing XML-files
+    :param out_dir: Path to folder to save output to
+    :param statistics: Statistics to export
+    :param convert: Process and clean the data (boolean)
+    :param n_jobs: Number of processes to use
+    :param sequential: Iterable with statistics to process sequentially (for memory-intensive stats)
+    """
+
+    xml_paths = glob.glob(os.path.join(xml_dir, '*.xml'))
+
+    if n_jobs is None:
+        n_jobs = multiprocessing.cpu_count() - 1
+
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    pool = multiprocessing.Pool(n_jobs)
+    for statistic in statistics:
+        if statistic in sequential:
+            df = pd.concat((_load_xml(p, statistic) for p in xml_paths), axis=0, ignore_index=True)
+        else:
+            partial_loader = partial(_load_xml, statistic=statistic)
+            df = pd.concat(pool.imap(partial_loader, xml_paths), axis=0, ignore_index=True)
+        if convert:
+            df = convert_export(df)
+        save_path = os.path.join(out_dir, '{}.csv'.format(statistic))
+        df.to_csv(save_path, index=False, encoding='utf8')
+        # Try to free up memory.
+        del df
+        gc.collect()
+        logger.debug("Exported %s to %s", statistic, save_path)
+
+
+def _load_xml(path, statistic):
+    """Load XML files ignoring etree.XMLSyntaxErrors.
+
+    :param path: Path to file.
+    :param statistic: Statistic to load (e.g. 'goals_attempts', 'cards').
+    :return: XML tree (or None on etree.XMLSyntaxError).
+    """
+    try:
+        return stats_from_file(path, statistic)
+    except etree.XMLSyntaxError:
+        msg = "XML error loading {}, skipping it...".format(path)
+        warnings.warn(msg, RuntimeWarning)
+
+
+def convert_export(df):
+    """Convert a statistics export.
+    :param df: pd.DataFrame with statistics (see e.g. stats_from_file())
+    :return: processed pd.DataFrame
+    """
+
+    def parse_indicator(s, indicator):
+        return s.notnull() & (s == indicator)  # Nulls are interpreted as False
+
+    convert_cols = {
+        'id': 'int',
+        'match_id': 'int',
+        'mins': 'int',
+        'minsec': 'int',
+        'secs': 'int',
+        'team_id': 'int'
+    }
+    coordinate_cols = [
+        'end',
+        'loc',
+        'middle',
+        'start',
+    ]
+    indicator_cols = {
+        'is_own': 'yes',
+        'headed': 'true',  # Note: ignores all falses
+        'shot': 'true',  # Note: ignores all falses
+    }
+    # Convert strings to ints.
+    for col in df.columns.intersection(convert_cols):
+        df[col] = df[col].replace('', -1)
+        df.loc[df[col].isnull(), col] = -1
+        df[col] = df[col].astype(convert_cols[col])
+
+    # Convert indicator cols.
+    for col in df.columns.intersection(indicator_cols):
+        df[col] = parse_indicator(df[col], indicator_cols[col])
+
+    # Convert coordinate cols.
+    for col in df.columns.intersection(coordinate_cols):
+        df[[col + '_x', col + '_y']] = split_coordinates(df[col])
+        df.drop(col, axis=1, inplace=True)
+
+    return df
+
+
+def split_coordinates(s):
+    """Split Series containing strings with coordinates into a DataFrame.
+
+    :param s: pd.Series
+    :return: pd.DataFrame with columns 'x' and 'y'
+    """
+    if s.notnull().all():
+        concatenated = s
+    else:
+        concatenated = s.copy()
+        concatenated.loc[concatenated.isnull()] = ','
+    split = pd.DataFrame(concatenated.str.split(',').tolist(), columns=['x', 'y'], dtype=float)
+    return split.replace('', np.nan)
